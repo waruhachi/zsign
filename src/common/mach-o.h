@@ -533,6 +533,7 @@ enum eReqMatchOp
 };
 
 /* SecRequirementType (from CSCommon.h) */
+#ifndef _H_CSCOMMON
 enum eSecRequirementType
 {
 	kZSecHostRequirementType = 1,
@@ -540,6 +541,7 @@ enum eSecRequirementType
 	kZSecDesignatedRequirementType = 3,
 	kZSecLibraryRequirementType = 4,
 };
+#endif
 
 #pragma pack(push, 1)
 
