@@ -86,6 +86,11 @@ bool ZBundle::GetSignFolderInfo(const string& strFolder, jvalue& jvNode, bool bG
 bool ZBundle::GetObjectsToSign(const string& strFolder, jvalue& jvInfo)
 {
 	vector<string> allBundles;
+	set<string> bundleExecutables;
+	string rootExecutable = jvInfo["bundle_executable"];
+	if (!rootExecutable.empty()) {
+		bundleExecutables.insert(rootExecutable);
+	}
 	
 	std::function<void(const string&)> findAllBundles = [&](const string& currentPath) {
 		ZFile::EnumFolder(currentPath.c_str(), false, NULL, [&](bool bFolder, const string& strPath) {
@@ -116,6 +121,11 @@ bool ZBundle::GetObjectsToSign(const string& strFolder, jvalue& jvInfo)
 	for (const string& bundlePath : allBundles) {
 		jvalue jvNode;
 		if (GetSignFolderInfo(bundlePath, jvNode)) {
+			string executable = jvNode["bundle_executable"];
+			string path = jvNode["path"];
+			if (!executable.empty() && !path.empty()) {
+				bundleExecutables.insert(path + "/" + executable);
+			}
 			jvInfo["folders"].push_back(jvNode);
 		}
 	}
@@ -134,17 +144,38 @@ bool ZBundle::GetObjectsToSign(const string& strFolder, jvalue& jvInfo)
 			fp = fopen(strPath.c_str(), "rb");
 #endif
 			if (fp) {
+				fseek(fp, 0, SEEK_END);
+				long fileSize = ftell(fp);
+				rewind(fp);
 				uint32_t magic = 0;
 				if (1 == fread(&magic, sizeof(magic), 1, fp)) {
-					bMachO = (magic == MH_MAGIC || magic == MH_CIGAM ||
-							  magic == MH_MAGIC_64 || magic == MH_CIGAM_64 ||
-							  magic == FAT_MAGIC || magic == FAT_CIGAM);
+					bMachO = fileSize >= (long)sizeof(mach_header) &&
+						(magic == MH_MAGIC || magic == MH_CIGAM || magic == MH_MAGIC_64 || magic == MH_CIGAM_64);
+					if (!bMachO && fileSize >= (long)sizeof(fat_header) && (magic == FAT_MAGIC || magic == FAT_CIGAM)) {
+						fat_header header;
+						rewind(fp);
+						if (1 == fread(&header, sizeof(header), 1, fp)) {
+							uint32_t count = (magic == FAT_MAGIC) ? header.nfat_arch : LE(header.nfat_arch);
+							bMachO = count > 0 && count <= ((size_t)fileSize - sizeof(fat_header)) / sizeof(fat_arch);
+							for (uint32_t i = 0; bMachO && i < count; i++) {
+								fat_arch arch;
+								if (1 != fread(&arch, sizeof(arch), 1, fp)) {
+									bMachO = false;
+									break;
+								}
+								uint32_t offset = (magic == FAT_MAGIC) ? arch.offset : LE(arch.offset);
+								uint32_t size = (magic == FAT_MAGIC) ? arch.size : LE(arch.size);
+								bMachO = offset <= (size_t)fileSize && size <= (size_t)fileSize - offset;
+							}
+						}
+					}
 				}
 				fclose(fp);
 			}
 		}
-		if (bMachO) {
-			jvInfo["files"].push_back(strPath.substr(m_strAppFolder.size() + 1));
+		string relativePath = strPath.substr(m_strAppFolder.size() + 1);
+		if (bMachO && !bundleExecutables.count(relativePath)) {
+			jvInfo["files"].push_back(relativePath);
 		}
 		return false;
 	});
@@ -276,11 +307,11 @@ void ZBundle::GetChangedFiles(jvalue& jvNode, vector<string>& arrChangedFiles)
 	}
 }
 
-void ZBundle::GetNodeChangedFiles(jvalue& jvNode, bool excludeProvisioning)
+void ZBundle::GetNodeChangedFiles(jvalue& jvNode, bool includeProvisioning)
 {
 	if (jvNode.has("folders")) {
 		for (size_t i = 0; i < jvNode["folders"].size(); i++) {
-			GetNodeChangedFiles(jvNode["folders"][i], excludeProvisioning);
+			GetNodeChangedFiles(jvNode["folders"][i], includeProvisioning);
 		}
 	}
 
@@ -290,7 +321,7 @@ void ZBundle::GetNodeChangedFiles(jvalue& jvNode, bool excludeProvisioning)
 		jvNode["changed"].push_back(arrChangedFiles[i]);
 	}
 	
-	if (excludeProvisioning) {
+	if (includeProvisioning) {
 		if ("/" == jvNode["path"]) { // root
 			jvNode["changed"].push_back("embedded.mobileprovision");
 		}
@@ -418,7 +449,7 @@ bool ZBundle::SignNode(jvalue& jvNode)
 		for (auto it = m_pSignAssets->rbegin(); it != m_pSignAssets->rend(); ++it) {
 			m_pSignAsset = &(*it);
 			if (endsWith(m_pSignAsset->m_strApplicationId, strBundleId)) {
-				if (!ZFile::WriteFileV(m_pSignAsset->m_strProvData, "%s/%s/embedded.mobileprovision", m_strAppFolder.c_str(), strFolder.c_str())) {
+				if (!m_bRemoveProvision && !ZFile::WriteFileV(m_pSignAsset->m_strProvData, "%s/%s/embedded.mobileprovision", m_strAppFolder.c_str(), strFolder.c_str())) {
 					ZLog::ErrorV(">>> Can't write embedded.mobileprovision!\n");
 					return false;
 				}
@@ -793,7 +824,7 @@ bool ZBundle::SignFolder(ZSignAsset* pSignAsset,
 							bool bEnableCache,
 							bool bRemoveProvision)
 {
-	m_bForceSign = bForce;
+	m_bForceSign = bForce || bRemoveProvision;
 	m_pSignAsset = pSignAsset;
 	m_bWeakInject = bWeakInject;
 	m_bRemoveProvision = bRemoveProvision;
@@ -830,13 +861,23 @@ bool ZBundle::SignFolder(ZSignAsset* pSignAsset,
 		}
 	}
 
-	ZFile::RemoveFileV("%s/embedded.mobileprovision", m_strAppFolder.c_str());
-	if (!pSignAsset->m_strProvData.empty()) {
-		if (bRemoveProvision) {
-			if (!ZFile::WriteFileV(pSignAsset->m_strProvData, "%s/embedded.mobileprovision", m_strAppFolder.c_str())) { // embedded.mobileprovision
+	string strProfilePath = m_strAppFolder + "/embedded.mobileprovision";
+	if (bRemoveProvision || pSignAsset->m_strProvData.empty()) {
+		if (ZFile::IsFileExists(strProfilePath.c_str())) {
+			if (!ZFile::RemoveFile(strProfilePath.c_str())) {
+				ZLog::ErrorV(">>> Can't remove embedded.mobileprovision!\n");
+				return false;
+			}
+			m_bForceSign = true;
+		}
+	} else {
+		string strExistingProfile;
+		if (!ZFile::ReadFile(strProfilePath.c_str(), strExistingProfile) || strExistingProfile != pSignAsset->m_strProvData) {
+			if (!ZFile::WriteFile(strProfilePath.c_str(), pSignAsset->m_strProvData)) {
 				ZLog::ErrorV(">>> Can't write embedded.mobileprovision!\n");
 				return false;
 			}
+			m_bForceSign = true;
 		}
 	}
 
@@ -868,7 +909,7 @@ bool ZBundle::SignFolder(ZSignAsset* pSignAsset,
 		if (!GetObjectsToSign(m_strAppFolder, jvRoot)) {
 			return false;
 		}
-		GetNodeChangedFiles(jvRoot, bRemoveProvision);
+		GetNodeChangedFiles(jvRoot, !bRemoveProvision && !pSignAsset->m_strProvData.empty());
 	} else {
 		jvRoot.read_from_file("./.zsign_cache/%s.json", strCacheName.c_str());
 	}
@@ -887,7 +928,7 @@ bool ZBundle::SignFolder(ZSignAsset* pSignAsset,
 	ZLog::PrintV(">>> TeamId: \t%s\n", m_pSignAsset->m_strTeamId.c_str());
 	ZLog::PrintV(">>> SubjectCN: \t%s\n", m_pSignAsset->m_strSubjectCN.c_str());
 	ZLog::PrintV(">>> ReadCache: \t%s\n", m_bForceSign ? "NO" : "YES");
-	ZLog::PrintV(">>> Exclude MobileProvision: \t%s\n", bRemoveProvision ? "NO" : "YES");
+	ZLog::PrintV(">>> Exclude MobileProvision: \t%s\n", bRemoveProvision ? "YES" : "NO");
 
 	if (SignNode(jvRoot)) {
 		if (bEnableCache) {
