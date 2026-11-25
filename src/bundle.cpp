@@ -513,6 +513,15 @@ bool ZBundle::SignNode(jvalue& jvNode)
 
 bool ZBundle::ModifyPluginsBundleId(const string& strOldBundleId, const string& strNewBundleId)
 {
+	const string strOldBundlePrefix = strOldBundleId + ".";
+	auto renameExtensionPoint = [&](const string& strIdentifier) {
+		if (!strOldBundleId.empty() &&
+			(strIdentifier == strOldBundleId || strIdentifier.compare(0, strOldBundlePrefix.size(), strOldBundlePrefix) == 0)) {
+			return strNewBundleId + strIdentifier.substr(strOldBundleId.size());
+		}
+		return strIdentifier;
+	};
+
 	vector<string> arrFolders;
 	ZFile::EnumFolder(m_strAppFolder.c_str(), true, NULL, [&](bool bFolder, const string& strPath) {
 		if (bFolder) {
@@ -556,8 +565,43 @@ bool ZBundle::ModifyPluginsBundleId(const string& strOldBundleId, const string& 
 			}
 		}
 
+		if (jvInfo.has("EXAppExtensionAttributes") && jvInfo["EXAppExtensionAttributes"].has("EXExtensionPointIdentifier")) {
+			string strOldEPID = jvInfo["EXAppExtensionAttributes"]["EXExtensionPointIdentifier"];
+			string strNewEPID = renameExtensionPoint(strOldEPID);
+			jvInfo["EXAppExtensionAttributes"]["EXExtensionPointIdentifier"] = strNewEPID;
+			ZLog::PrintV(">>> BundleId: \t%s -> %s, EXAppExtensionAttributes-EXExtensionPointIdentifier\n", strOldEPID.c_str(), strNewEPID.c_str());
+		}
+
 		jvInfo.style_write_plist_to_file("%s/Info.plist", strFolder.c_str());
 	}
+
+	ZFile::EnumFolder((m_strAppFolder + "/Extensions").c_str(), false, NULL, [&](bool bFolder, const string& strPath) {
+		if (bFolder || !ZFile::IsPathSuffix(strPath, ".appexpt")) {
+			return false;
+		}
+		jvalue jvPoints;
+		if (!jvPoints.read_plist_from_file("%s", strPath.c_str())) {
+			ZLog::WarnV(">>> Can't read extension points! %s\n", strPath.c_str());
+			return false;
+		}
+		bool bChanged = false;
+		vector<string> arrKeys;
+		jvPoints.get_keys(arrKeys);
+		for (const string& strOldKey : arrKeys) {
+			string strNewKey = renameExtensionPoint(strOldKey);
+			if (strNewKey != strOldKey) {
+				jvalue jvPoint = jvPoints[strOldKey];
+				jvPoints[strNewKey] = jvPoint;
+				jvPoints.erase(strOldKey.c_str());
+				bChanged = true;
+				ZLog::PrintV(">>> BundleId: \t%s -> %s, ExtensionPoint\n", strOldKey.c_str(), strNewKey.c_str());
+			}
+		}
+		if (bChanged) {
+			jvPoints.style_write_plist_to_file("%s", strPath.c_str());
+		}
+		return false;
+	});
 
 	return true;
 }
